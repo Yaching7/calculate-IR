@@ -1,7 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { MasSoraRecord } from '../types/sora';
 import { parseMasCsvOrJson } from '../data/masSoraData';
-import { Check, Copy, Download, RotateCcw, Search, Upload } from 'lucide-react';
+import { Check, Copy, Download, RefreshCw, RotateCcw, Search, Server, Upload } from 'lucide-react';
 
 interface MasDataFeedPanelProps {
   records: MasSoraRecord[];
@@ -18,21 +18,18 @@ const SAMPLE_MAS_CSV = `end_of_day,sora,sora_index,comp_sora_1m,comp_sora_3m,com
 2026-10-01,2.6790,114.03454190,2.6918,2.7235,2.7790,2040
 2026-10-02,2.6725,114.04291044,2.6911,2.7229,2.7784,1985`;
 
-const BACKEND_ADAPTER_SNIPPET = `// Ready-to-wire Backend Adapter for MAS Domestic Interest Rates API
-// Endpoint: https://eservices.mas.gov.sg/api/action/datastore/search.json
-export interface MasApiQueryParams {
-  resource_id: string; // e.g. '9a0bf149-308c-4bd2-832d-76c8e6cb47ed'
-  between?: string;    // 'end_of_day,2026-01-01,2026-10-05'
-  limit?: number;
-}
+const SERVERLESS_INTEGRATION_SNIPPET = `// /api/sora.ts (Serverless handler)
+// Endpoint: https://eservices.mas.gov.sg/apimg-gw/server/monthly_statistical_bulletin_non610mssql/domestic_interest_rates_daily/views/domestic_interest_rates_daily
+// Header: KeyId: <MAS_KEY_ID>
 
-export async function fetchMasSoraRates(startDate: string, endDate: string) {
+export default async function handler(req, res) {
+  const masKeyId = process.env.MAS_KEY_ID || req.headers['keyid'];
   const response = await fetch(
-    \`/api/mas/sora?start=\${encodeURIComponent(startDate)}&end=\${encodeURIComponent(endDate)}\`
+    'https://eservices.mas.gov.sg/apimg-gw/server/monthly_statistical_bulletin_non610mssql/domestic_interest_rates_daily/views/domestic_interest_rates_daily?limit=500',
+    { headers: { KeyId: masKeyId } }
   );
-  if (!response.ok) throw new Error(\`MAS rate feed error: \${response.status}\`);
-  const payload = await response.json();
-  return payload.records; // Maps directly into parseMasCsvOrJson()
+  const data = await response.json();
+  res.json(data);
 }`;
 
 export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
@@ -50,6 +47,84 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
   const [editingDate, setEditingDate] = useState<string | null>(null);
   const [editingValue, setEditingValue] = useState<string>('');
   const [copiedSnippet, setCopiedSnippet] = useState(false);
+
+  // Serverless API integration state
+  const [healthInfo, setHealthInfo] = useState<{ status: string; hasApiKey: boolean } | null>(null);
+  const [isFetchingLive, setIsFetchingLive] = useState(false);
+  const [manualKeyId, setManualKeyId] = useState('');
+  const [liveFetchResult, setLiveFetchResult] = useState<{ type: 'idle' | 'success' | 'error'; message: string }>({
+    type: 'idle',
+    message: '',
+  });
+
+  const checkHealth = async () => {
+    try {
+      const res = await fetch('/api/health');
+      if (res.ok) {
+        const data = await res.json();
+        setHealthInfo({ status: data.status, hasApiKey: data.hasApiKey });
+      } else {
+        setHealthInfo({ status: 'offline', hasApiKey: false });
+      }
+    } catch {
+      setHealthInfo({ status: 'offline', hasApiKey: false });
+    }
+  };
+
+  useEffect(() => {
+    checkHealth();
+  }, []);
+
+  const handleFetchLiveMasData = async () => {
+    setIsFetchingLive(true);
+    setLiveFetchResult({ type: 'idle', message: '' });
+
+    try {
+      const headers: Record<string, string> = {};
+      if (manualKeyId.trim()) {
+        headers['KeyId'] = manualKeyId.trim();
+      }
+
+      const res = await fetch('/api/sora?limit=500', { headers });
+      const payload = await res.json();
+
+      if (!res.ok || !payload.success) {
+        setLiveFetchResult({
+          type: 'error',
+          message: payload.error || `HTTP ${res.status}: Failed to pull from MAS API Gateway`,
+        });
+        setIsFetchingLive(false);
+        return;
+      }
+
+      if (Array.isArray(payload.records) && payload.records.length > 0) {
+        const mergedMap = new Map<string, MasSoraRecord>();
+        for (const r of records) mergedMap.set(r.end_of_day, r);
+        for (const r of payload.records) mergedMap.set(r.end_of_day, r);
+        const merged = Array.from(mergedMap.values()).sort((a, b) =>
+          a.end_of_day.localeCompare(b.end_of_day)
+        );
+        onUpdateRecords(merged);
+        setLiveFetchResult({
+          type: 'success',
+          message: `Successfully pulled ${payload.records.length} records from MAS gateway! (${merged.length} total business days in local dataset)`,
+        });
+        checkHealth();
+      } else {
+        setLiveFetchResult({
+          type: 'error',
+          message: 'MAS returned 0 daily records in response payload.',
+        });
+      }
+    } catch (err) {
+      setLiveFetchResult({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Failed to connect to /api/sora serverless endpoint.',
+      });
+    } finally {
+      setIsFetchingLive(false);
+    }
+  };
 
   const filteredRecords = useMemo(() => {
     const rev = [...records].reverse();
@@ -124,22 +199,107 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
   };
 
   const handleCopySnippet = () => {
-    navigator.clipboard.writeText(BACKEND_ADAPTER_SNIPPET);
+    navigator.clipboard.writeText(SERVERLESS_INTEGRATION_SNIPPET);
     setCopiedSnippet(true);
     setTimeout(() => setCopiedSnippet(false), 2000);
   };
 
   return (
     <div className="space-y-8">
+      {/* Live Serverless Connection Status Banner */}
+      <div className="bg-white border border-slate-200 rounded-lg p-5">
+        <div className="flex flex-wrap items-center justify-between gap-4 pb-4 border-b border-slate-100">
+          <div className="flex items-center gap-3">
+            <div className="w-9 h-9 rounded-lg bg-slate-100 flex items-center justify-center text-slate-700">
+              <Server className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-base font-semibold text-slate-900">
+                  MAS Serverless Live Connection (/api/sora & /api/health)
+                </h2>
+                <span
+                  className={`text-[11px] font-mono font-medium ${
+                    healthInfo?.status === 'ok' ? 'text-emerald-700' : 'text-slate-500'
+                  }`}
+                >
+                  · Status: {healthInfo ? healthInfo.status.toUpperCase() : 'CHECKING'}
+                </span>
+                <span className="text-[11px] font-mono text-slate-500">
+                  · Key Configured:{' '}
+                  <strong className={healthInfo?.hasApiKey ? 'text-emerald-700' : 'text-amber-700'}>
+                    {healthInfo?.hasApiKey ? 'YES (process.env.MAS_KEY_ID)' : 'PENDING'}
+                  </strong>
+                </span>
+              </div>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Routes live queries with <code className="font-mono text-slate-800">KeyId: &lt;MAS_KEY_ID&gt;</code> to MAS Domestic Interest Rates Gateway
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={checkHealth}
+              className="px-3 py-1.5 text-xs font-medium text-slate-700 border border-slate-200 rounded-md hover:bg-slate-50 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              <span>Ping /api/health</span>
+            </button>
+            <button
+              type="button"
+              disabled={isFetchingLive}
+              onClick={handleFetchLiveMasData}
+              className="px-4 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-50 inline-flex items-center gap-1.5 whitespace-nowrap"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isFetchingLive ? 'animate-spin' : ''}`} />
+              <span>{isFetchingLive ? 'Pulling MAS Data...' : 'Pull Live MAS SORA Rates'}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Live Pull Controls & Response Feedback */}
+        <div className="pt-4 flex flex-wrap items-center justify-between gap-4">
+          <div className="flex-1 min-w-[280px]">
+            <label className="block text-[11px] font-medium text-slate-600 mb-1">
+              Optional Manual KeyId (Used if <code className="font-mono">MAS_KEY_ID</code> is not in .env):
+            </label>
+            <input
+              type="password"
+              placeholder="Paste your MAS API KeyId to test connection..."
+              value={manualKeyId}
+              onChange={(e) => setManualKeyId(e.target.value)}
+              className="w-full max-w-md px-3 py-1.5 text-xs font-mono bg-slate-50 border border-slate-200 rounded-md text-slate-900 focus:outline-none focus:border-slate-900"
+            />
+          </div>
+
+          <div className="text-xs text-right">
+            {liveFetchResult.type === 'error' && (
+              <span className="text-red-700 font-medium">Error: {liveFetchResult.message}</span>
+            )}
+            {liveFetchResult.type === 'success' && (
+              <span className="text-emerald-700 font-medium">{liveFetchResult.message}</span>
+            )}
+            {liveFetchResult.type === 'idle' && (
+              <span className="text-slate-500">
+                Endpoint: <code className="font-mono text-[11px]">/api/sora</code>
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* 2-Column Ingestion & Serverless Contract Grid */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         <div className="lg:col-span-7 bg-white border border-slate-200 rounded-lg p-6">
           <div className="flex items-center justify-between gap-4">
             <div>
               <h2 className="text-base font-semibold text-slate-900">
-                Ingest MAS Overnight Rate Payload (CSV or JSON)
+                Manual MAS CSV or JSON Payload Ingestion
               </h2>
               <p className="text-xs text-slate-500 mt-1">
-                Paste a Monetary Authority of Singapore (MAS) Domestic Interest Rates CSV export or JSON response to update the local rate table.
+                Paste an offline MAS Domestic Interest Rates CSV export or JSON response to merge into the active calculation table.
               </p>
             </div>
             <div className="flex items-center gap-2">
@@ -166,7 +326,7 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
           <textarea
             value={rawImportText}
             onChange={(e) => setRawImportText(e.target.value)}
-            rows={6}
+            rows={5}
             placeholder="end_of_day,sora,sora_index,comp_sora_1m,comp_sora_3m,comp_sora_6m&#10;2026-10-02,2.6725,114.04291044,2.6911,2.7229,2.7784"
             className="mt-4 w-full font-mono text-xs bg-slate-50 border border-slate-200 rounded-md p-3 text-slate-800 focus:outline-none focus:border-slate-900"
           />
@@ -206,11 +366,12 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
           </div>
         </div>
 
+        {/* Serverless Function Architecture Documentation */}
         <div className="lg:col-span-5 bg-white border border-slate-200 rounded-lg p-6 flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between gap-2">
               <h2 className="text-base font-semibold text-slate-900">
-                Backend Integration Contract
+                Serverless Function Files (/api)
               </h2>
               <button
                 type="button"
@@ -225,16 +386,16 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
                 ) : (
                   <>
                     <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Adapter</span>
+                    <span>Copy Handler</span>
                   </>
                 )}
               </button>
             </div>
             <p className="text-xs text-slate-500 mt-1">
-              The calculation engine consumes `MasSoraRecord[]`. Connect your backend proxy route to MAS `datastore/search.json` using this schema:
+              Located at root level <code className="font-mono">/api/sora.ts</code> and <code className="font-mono">/api/health.ts</code>. Reads <code className="font-mono">MAS_KEY_ID</code> from process environment:
             </p>
             <pre className="mt-3 p-3 bg-slate-900 text-slate-100 rounded-md font-mono text-[11px] leading-relaxed overflow-x-auto">
-              {BACKEND_ADAPTER_SNIPPET}
+              {SERVERLESS_INTEGRATION_SNIPPET}
             </pre>
           </div>
 
@@ -245,6 +406,7 @@ export const MasDataFeedPanel: React.FC<MasDataFeedPanelProps> = ({
         </div>
       </div>
 
+      {/* Interactive MAS Overnight Rate Table */}
       <div className="bg-white border border-slate-200 rounded-lg">
         <div className="px-6 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-4">
           <div>
