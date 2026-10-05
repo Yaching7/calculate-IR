@@ -1,0 +1,8 @@
+{
+  "name": "SORA Calc SG",
+  "description": "A simple, efficient calculator for accurate Singapore Overnight Rate Average interest payment projections and financial planning.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
